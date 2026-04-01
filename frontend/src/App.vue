@@ -14,6 +14,12 @@
   </nav>
 
   <div class="container py-4 fade-in-up">
+    <div v-if="errorMessage" class="alert alert-danger" role="alert">
+      {{ errorMessage }}
+    </div>
+    <div v-else-if="loading" class="alert alert-info" role="alert">
+      Loading events...
+    </div>
     <div class="row g-4">
       <!-- Left Column -->
       <div class="col-lg-4">
@@ -94,7 +100,8 @@ import SheetMusicManager from "./components/SheetMusicManager.vue";
 import SongSelector from "./components/SongSelector.vue";
 import EventModal from "./components/EventModal.vue";
 import SheetModal from "./components/SheetModal.vue";
-import { masterInstruments, exampleEvents } from "./data/instruments";
+import { masterInstruments } from "./data/instruments";
+import { api } from "./api";
 
 // State
 const events = ref([]);
@@ -110,6 +117,18 @@ const formEvent = ref({
   songs: [],
   instrumentIds: [],
 });
+const loading = ref(false);
+const errorMessage = ref("");
+
+const normalizeEvent = (ev) => {
+  const sheets = ev.sheets && typeof ev.sheets === "object" ? ev.sheets : {};
+  return {
+    ...ev,
+    songs: Array.isArray(ev.songs) ? ev.songs : [],
+    instrumentIds: ev.instrumentIds || [],
+    sheets,
+  };
+};
 
 // Computed
 const currentEvent = computed(() => {
@@ -143,29 +162,20 @@ const songAssignments = computed(() => {
 });
 
 // Methods
-const loadEvents = () => {
-  const stored = localStorage.getItem("orchestra_sheet_mgr");
-  if (stored) {
-    events.value = JSON.parse(stored);
-    events.value.forEach((ev) => {
-      if (!ev.sheets) ev.sheets = {};
-      if (!ev.songs) ev.songs = Array(ev.songsCount || 0).fill("");
-    });
-  } else {
-    events.value = JSON.parse(JSON.stringify(exampleEvents));
-    events.value.forEach((ev) => {
-      if (!ev.sheets) ev.sheets = {};
-      if (!ev.songs) ev.songs = Array(ev.songsCount || 0).fill("");
-    });
-    saveToLocal();
+const loadEvents = async () => {
+  loading.value = true;
+  errorMessage.value = "";
+  try {
+    const data = await api.getEvents();
+    events.value = data.map(normalizeEvent);
+    if (events.value.length) {
+      selectedEventId.value = events.value[0].id;
+    }
+  } catch (err) {
+    errorMessage.value = err.message || "Failed to load events";
+  } finally {
+    loading.value = false;
   }
-  if (events.value.length) {
-    selectedEventId.value = events.value[0].id;
-  }
-};
-
-const saveToLocal = () => {
-  localStorage.setItem("orchestra_sheet_mgr", JSON.stringify(events.value));
 };
 
 const selectEvent = (id) => {
@@ -205,59 +215,52 @@ const editEvent = (ev) => {
   eventModalRef.value.show();
 };
 
-const saveEvent = (eventData) => {
-  if (modalMode.value === "create") {
-    const newEvent = {
-      id: "ev_" + Date.now(),
-      name: eventData.name,
-      songsCount: eventData.songsCount,
-      songs: (eventData.songs || [])
-        .slice(0, eventData.songsCount)
-        .map((s) => (s ? s.trim() : "")),
-      instrumentIds: eventData.instrumentIds,
-      sheets: {},
-    };
-    events.value.push(newEvent);
-    selectedEventId.value = newEvent.id;
-    selectedInstrumentId.value = null;
-  } else {
-    const idx = events.value.findIndex((ev) => ev.id === eventData.id);
-    if (idx !== -1) {
-      const oldSheets = events.value[idx].sheets || {};
-      const newSheets = {};
-      eventData.instrumentIds.forEach((instId) => {
-        if (oldSheets[instId]) newSheets[instId] = oldSheets[instId];
-        else newSheets[instId] = [];
-      });
-      events.value[idx] = {
-        ...events.value[idx],
-        name: eventData.name,
-        songsCount: eventData.songsCount,
-        songs: (eventData.songs || [])
-          .slice(0, eventData.songsCount)
-          .map((s) => (s ? s.trim() : "")),
-        instrumentIds: eventData.instrumentIds,
-        sheets: newSheets,
-      };
+const saveEvent = async (eventData) => {
+  const payload = {
+    name: eventData.name,
+    songsCount: eventData.songsCount,
+    songs: (eventData.songs || [])
+      .slice(0, eventData.songsCount)
+      .map((s) => (s ? s.trim() : "")),
+    instrumentIds: eventData.instrumentIds,
+  };
+
+  try {
+    if (modalMode.value === "create") {
+      const created = await api.createEvent(payload);
+      const normalized = normalizeEvent(created);
+      events.value.push(normalized);
+      selectedEventId.value = normalized.id;
+      selectedInstrumentId.value = null;
+    } else {
+      const updated = await api.updateEvent(eventData.id, payload);
+      const normalized = normalizeEvent(updated);
+      const idx = events.value.findIndex((ev) => ev.id === eventData.id);
+      if (idx !== -1) events.value[idx] = normalized;
       if (
         selectedInstrumentId.value &&
-        !eventData.instrumentIds.includes(selectedInstrumentId.value)
+        !normalized.instrumentIds.includes(selectedInstrumentId.value)
       ) {
         selectedInstrumentId.value = null;
       }
     }
+  } catch (err) {
+    alert(err.message || "Failed to save event");
   }
-  saveToLocal();
 };
 
 const deleteEvent = (id) => {
   if (confirm("Delete this concert event? All sheet music assignments will be lost.")) {
-    events.value = events.value.filter((ev) => ev.id !== id);
-    if (selectedEventId.value === id) {
-      selectedEventId.value = events.value.length ? events.value[0].id : null;
-      selectedInstrumentId.value = null;
-    }
-    saveToLocal();
+    api
+      .deleteEvent(id)
+      .then(() => {
+        events.value = events.value.filter((ev) => ev.id !== id);
+        if (selectedEventId.value === id) {
+          selectedEventId.value = events.value.length ? events.value[0].id : null;
+          selectedInstrumentId.value = null;
+        }
+      })
+      .catch((err) => alert(err.message || "Failed to delete event"));
   }
 };
 
@@ -267,18 +270,18 @@ const openSheetModal = (songName = "") => {
   }
 };
 
-const addSheet = (sheetData) => {
+const addSheet = async (sheetData) => {
   if (!currentEvent.value || !selectedInstrumentId.value) return;
 
-  if (!currentEvent.value.sheets) {
-    currentEvent.value.sheets = {};
+  try {
+    const created = await api.addSheet(currentEvent.value.id, selectedInstrumentId.value, sheetData);
+    if (!currentEvent.value.sheets[selectedInstrumentId.value]) {
+      currentEvent.value.sheets[selectedInstrumentId.value] = [];
+    }
+    currentEvent.value.sheets[selectedInstrumentId.value].push(created);
+  } catch (err) {
+    alert(err.message || "Failed to add sheet");
   }
-  if (!currentEvent.value.sheets[selectedInstrumentId.value]) {
-    currentEvent.value.sheets[selectedInstrumentId.value] = [];
-  }
-
-  currentEvent.value.sheets[selectedInstrumentId.value].push(sheetData);
-  saveToLocal();
 };
 
 const removeSheet = (sheetId) => {
@@ -287,26 +290,27 @@ const removeSheet = (sheetId) => {
   if (sheetsArr) {
     const idx = sheetsArr.findIndex((s) => s.id === sheetId);
     if (idx !== -1) {
-      sheetsArr.splice(idx, 1);
-      saveToLocal();
+      api
+        .deleteSheet(currentEvent.value.id, selectedInstrumentId.value, sheetId)
+        .then(() => {
+          sheetsArr.splice(idx, 1);
+        })
+        .catch((err) => alert(err.message || "Failed to remove sheet"));
     }
   }
 };
 
 const assignSong = (payload) => {
   if (!currentEvent.value) return;
-  if (!currentEvent.value.sheets) currentEvent.value.sheets = {};
-  if (!currentEvent.value.sheets[payload.instrumentId]) {
-    currentEvent.value.sheets[payload.instrumentId] = [];
-  }
-  currentEvent.value.sheets[payload.instrumentId].push({
-    id: payload.id || "sheet_" + Date.now(),
-    title: payload.title,
-    composer: payload.composer,
-    fileUrl: payload.fileUrl,
-    notes: payload.notes,
-  });
-  saveToLocal();
+  api
+    .addSheet(currentEvent.value.id, payload.instrumentId, payload)
+    .then((created) => {
+      if (!currentEvent.value.sheets[payload.instrumentId]) {
+        currentEvent.value.sheets[payload.instrumentId] = [];
+      }
+      currentEvent.value.sheets[payload.instrumentId].push(created);
+    })
+    .catch((err) => alert(err.message || "Failed to save assignment"));
 };
 
 onMounted(() => {
